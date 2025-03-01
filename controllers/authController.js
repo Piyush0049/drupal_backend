@@ -37,7 +37,8 @@ exports.registerUser = async (req, res, next) => {
       "1": username,
       "2": email,
       "3": password,
-      "4": new Date().toISOString()
+      "4": new Date().toISOString(),
+      "weight": 0
     };
 
     table[newRowKey] = newRow;
@@ -52,7 +53,6 @@ exports.registerUser = async (req, res, next) => {
       }
     };
 
-    // Update the node with the new user table.
     await axios.patch(nodeUrl, payload, {
       headers: { 'Content-Type': 'application/vnd.api+json' }
     });
@@ -63,14 +63,9 @@ exports.registerUser = async (req, res, next) => {
   }
 };
 
-/**
- * Log in a user by checking Drupal data for matching email and password.
- */
 exports.loginUser = async (req, res, next) => {
   try {
     const { email, password } = req.body;
-
-    // Fetch current Drupal node data.
     const nodeData = await fetchDrupalData();
     let table = nodeData.attributes.field_mydata.value || {};
 
@@ -87,25 +82,85 @@ exports.loginUser = async (req, res, next) => {
     if (!foundUser) {
       return res.status(400).json({ message: 'Invalid credentials', success: false });
     }
-
-    // Check if passwords match (in production, compare hashed passwords)
     if (foundUser["3"] !== password) {
       return res.status(400).json({ message: 'Invalid credentials', success: false });
     }
 
-    // Create JWT token payload using the user ID from row["0"]
     const payload = { userId: foundUser["0"] };
     const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '1h' });
+    console.log("foundUser", foundUser)
 
-    // Set token as an HTTP-only cookie.
     res.cookie('token', token, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      maxAge: 3600000, // 1 hour
+      sameSite: "none",
+      secure: true,
+      maxAge: 3600000,
     });
 
     res.json({ message: 'Logged in successfully', success: true });
   } catch (error) {
+    next(error);
+  }
+};
+
+
+
+exports.verify = async (req, res, next) => {
+  try {
+    const token = req.cookies.token;
+    if (!token) {
+      return res.status(401).json({ valid: false, message: 'No token provided' });
+    }
+    try {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      console.log(decoded)
+      const userId = decoded.userId;
+      const nodeData = await fetchDrupalData();
+      let table = nodeData.attributes.field_mydata.value || {};
+      console.log(table)
+      let foundUser = false;
+      for (const key in table) {
+        if(key===userId){
+          foundUser=true;
+        }
+      }
+      if (!foundUser) {
+        res.clearCookie('token', { httpOnly: true, secure: true, sameSite: 'strict' });
+        console.log("2")
+        return res.status(400).json({ message: 'Invalid credentials', success: false });
+      }
+      return res.status(200).json({ valid: true, user: decoded });
+    } catch (error) {
+      res.clearCookie('token', { httpOnly: true, secure: true, sameSite: 'strict' });
+      console.log("3")
+      console.log(error)
+      return res.status(401).json({ valid: false, message: 'Invalid token. Token deleted.' });
+    }
+  } catch (error) {
+    console.error('Error verifying user:', error);
+    next(error);
+  }
+};
+
+
+
+exports.logout = async (req, res, next) => {
+  try {
+    const token = req.cookies.token;
+    if (!token) {
+      return res.status(401).json({ valid: false, message: 'No token provided' });
+    }
+    try {
+      res.clearCookie('token', { httpOnly: true, secure: true, sameSite: 'strict' });
+      return res.status(200).json({ valid: false, success: true, message: "Logout successfully!" });
+    } catch (error) {
+      res.clearCookie('token', { httpOnly: true, secure: true, sameSite: 'strict' });
+      console.log("3")
+      console.log(error)
+      return res.status(401).json({ valid: false, message: 'Invalid token. Token deleted.' });
+    }
+  } catch (error) {
+    console.error('Error verifying user:', error);
     next(error);
   }
 };
