@@ -1,67 +1,209 @@
+const jwt = require("jsonwebtoken")
+const path = require('path');
+const fs = require('fs');
 const axios = require('axios');
-const jwt = require('jsonwebtoken');
-
-const drupalBaseUrl = process.env.DRUPAL_BASE_URL; // e.g., http://localhost
-const drupalNodeId = process.env.DRUPAL_NODE_ID;   // e.g., 9bf2afaa-f7ea-4e2f-a736-4f3ddec1f285
-const nodeUrl = `${drupalBaseUrl}/jsonapi/node/mydata/${drupalNodeId}`;
+const { generateOTP } = require('../utils/generateOTP');
+const { sendMail } = require('../utils/sendMail');
+const drupalBaseUrl = process.env.DRUPAL_BASE_URL;
+const drupalAuthUsersNodeId = process.env.DRUPAL_AUTH_NODE_ID;
+const drupalAuthOTPNodeId = process.env.DRUPAL_OTP_NODE_ID;
 
 
 const fetchDrupalData = async () => {
-  const response = await axios.get(nodeUrl, {
+  const response = await axios.get(`${drupalBaseUrl}/jsonapi/node/mydata/${drupalAuthUsersNodeId}`, {
     headers: { 'Content-Type': 'application/vnd.api+json' }
   });
   return response.data.data;
 };
 
+
+const fetchDrupalOTPData = async () => {
+  const response = await axios.get(`${drupalBaseUrl}/jsonapi/node/mydata/${drupalAuthOTPNodeId}`, {
+    headers: { 'Content-Type': 'application/vnd.api+json' }
+  });
+  return response.data.data;
+};
+
+
 exports.registerUser = async (req, res, next) => {
   try {
     const { username, email, password } = req.body;
+
     const nodeData = await fetchDrupalData();
     let table = nodeData.attributes.field_mydata.value || {};
-    let duplicateFound = false;
+
     for (const key in table) {
       if (key === "0") continue;
       const row = table[key];
       if (row["1"] === username || row["2"] === email) {
-        duplicateFound = true;
+        return res.status(400).json({ message: 'User already exists', success: false });
+      }
+    }
+
+    const nodeOTPData = await fetchDrupalOTPData();
+    let otpTable = nodeOTPData.attributes.field_mydata.value || {};
+
+    const OTP = generateOTP();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    const createdAt = new Date().toISOString();
+
+    let otpKey = null;
+
+    for (const key in otpTable) {
+      if (key === "0") continue;
+      const row = otpTable[key];
+      if (row["1"] === username || row["2"] === email) {
+        otpKey = key;
         break;
       }
     }
 
-    if (duplicateFound) {
-      return res.status(400).json({ message: 'User already exists', success: false });
+    if (otpKey) {
+      otpTable[otpKey]["4"] = OTP;
+      otpTable[otpKey]["5"] = createdAt; 
+      otpTable[otpKey]["6"] = expiresAt;
+    } else {
+      const newOtpKey = Date.now().toString();
+      otpTable[newOtpKey] = {
+        "0": newOtpKey,
+        "1": username,
+        "2": email,
+        "3": password,
+        "4": OTP,
+        "5": createdAt,
+        "6": expiresAt,
+        "weight": 0
+      };
     }
+
+    const templatePath = path.join(__dirname, '..', 'utils', 'templates', 'emailTemplate.html');
+    let emailContent = fs.readFileSync(templatePath, 'utf-8');
+    emailContent = emailContent.replace('{{name}}', username);
+    emailContent = emailContent.replace('{{otp_code}}', OTP);
+
+    await sendMail({
+      email,
+      subject: 'OTP Verification',
+      message: emailContent,
+      tag: 'otp',
+    });
+
+    const otpPayload = {
+      data: {
+        type: "node--mydata",
+        id: drupalAuthOTPNodeId,
+        attributes: {
+          field_mydata: { value: otpTable }
+        }
+      }
+    };
+
+    await axios.patch(`${drupalBaseUrl}/jsonapi/node/mydata/${drupalAuthOTPNodeId}`, otpPayload, {
+      headers: { 'Content-Type': 'application/vnd.api+json' }
+    });
+
+    res.status(200).json({ message: 'OTP sent successfully', success: true });
+
+  } catch (error) {
+    next(error);
+  }
+};
+
+
+
+exports.otpVerification = async (req, res, next) => {
+  try {
+    const { otp, email } = req.body;
+    const nodeOTPData = await fetchDrupalOTPData();
+    let otpTable = nodeOTPData.attributes.field_mydata.value || {};
+
+    let otpKey = null;
+    let otpData = null;
+
+    for (const key in otpTable) {
+      if (key === "0") continue;
+      const row = otpTable[key];
+      if (row["2"] === email) {
+        otpKey = key;
+        otpData = row;
+        break;
+      }
+    }
+
+    if (!otpData) {
+      return res.status(404).json({
+        success: false,
+        message: "OTP not found",
+      });    
+    }
+    console.log(otp)
+
+    if (otp === otpData["4"]) {
+      console.log("yes yeah");
+    }
+
+    if (otp !== otpData["4"] || new Date(otpData["6"]) < new Date()) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid or expired OTP",
+      });
+    }
+
+    const nodeData = await fetchDrupalData();
+    let table = nodeData.attributes.field_mydata.value || {};
+
     const newRowKey = Date.now().toString();
     const newRow = {
       "0": newRowKey,
-      "1": username,
-      "2": email,
-      "3": password,
+      "1": otpData["1"], // Username
+      "2": otpData["2"], // Email
+      "3": otpData["3"],
       "4": new Date().toISOString(),
       "weight": 0
     };
 
     table[newRowKey] = newRow;
 
-    const payload = {
+    const userPayload = {
       data: {
         type: "node--mydata",
-        id: drupalNodeId,
+        id: drupalAuthUsersNodeId,
         attributes: {
           field_mydata: { value: table }
         }
       }
     };
 
-    await axios.patch(nodeUrl, payload, {
+    await axios.patch(`${drupalBaseUrl}/jsonapi/node/mydata/${drupalAuthUsersNodeId}`, userPayload, {
       headers: { 'Content-Type': 'application/vnd.api+json' }
     });
 
-    res.status(201).json({ message: 'User created successfully', success: true });
+    delete otpTable[otpKey];
+
+    const otpPayload = {
+      data: {
+        type: "node--mydata",
+        id: drupalAuthOTPNodeId,
+        attributes: {
+          field_mydata: { value: otpTable }
+        }
+      }
+    };
+
+    await axios.patch(`${drupalBaseUrl}/jsonapi/node/mydata/${drupalAuthOTPNodeId}`, otpPayload, {
+      headers: { 'Content-Type': 'application/vnd.api+json' }
+    });
+    return res.status(200).json({ message: 'Registered Successfully!', success: true });
   } catch (error) {
-    next(error);
+    console.log(error)
+    return res.status(500).json({
+      success: false,
+      message: "Internet server error",
+    });
   }
 };
+
+
 
 exports.loginUser = async (req, res, next) => {
   try {
@@ -71,7 +213,7 @@ exports.loginUser = async (req, res, next) => {
 
     let foundUser = null;
     for (const key in table) {
-      if (key === "0") continue; // skip header
+      if (key === "0") continue;
       const row = table[key];
       if (row["2"] === email) {
         foundUser = row;
@@ -120,8 +262,8 @@ exports.verify = async (req, res, next) => {
       console.log(table)
       let foundUser = false;
       for (const key in table) {
-        if(key===userId){
-          foundUser=true;
+        if (key === userId) {
+          foundUser = true;
         }
       }
       if (!foundUser) {
@@ -139,6 +281,72 @@ exports.verify = async (req, res, next) => {
   } catch (error) {
     console.error('Error verifying user:', error);
     next(error);
+  }
+};
+
+
+
+exports.resentOtp = async (req, res, next) => {
+  try {
+    const { email } = req.body;
+
+    const nodeOTPData = await fetchDrupalOTPData();
+    let otpTable = nodeOTPData.attributes.field_mydata.value || {};
+
+    const OTP = generateOTP();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    const createdAt = new Date().toISOString();
+
+    let otpKey = null;
+
+    for (const key in otpTable) {
+      if (key === "0") continue;
+      const row = otpTable[key];
+      if (row["1"] === username || row["2"] === email) {
+        otpKey = key;
+        break;
+      }
+    }
+
+    if (otpKey) {
+      otpTable[otpKey]["4"] = OTP;
+      otpTable[otpKey]["5"] = createdAt; 
+      otpTable[otpKey]["6"] = expiresAt;
+    }
+
+    const otpPayload = {
+      data: {
+        type: "node--mydata",
+        id: drupalAuthOTPNodeId,
+        attributes: {
+          field_mydata: { value: otpTable }
+        }
+      }
+    };
+
+    await axios.patch(`${drupalBaseUrl}/jsonapi/node/mydata/${drupalAuthOTPNodeId}`, otpPayload, {
+      headers: { 'Content-Type': 'application/vnd.api+json' }
+    });
+
+
+    const templatePath = path.join(__dirname, '..', 'utils', 'templates', 'emailTemplate.html');
+    let emailContent = fs.readFileSync(templatePath, 'utf-8');
+    emailContent = emailContent.replace('{{name}}', username);
+    emailContent = emailContent.replace('{{otp_code}}', OTP);
+
+    await sendMail({
+      email,
+      subject: 'New OTP for Verification',
+      message: emailContent,
+      tag: 'otp',
+    });
+
+    res.status(200).json({
+      success: true,
+      message: `OTP resent successfully to ${email}`,
+    });
+  } catch (error) {
+    console.log(error);
   }
 };
 
